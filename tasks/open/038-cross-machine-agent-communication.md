@@ -27,13 +27,34 @@ Four mechanisms, all of which pass a live object reference:
 | Mechanism | Where | What it passes |
 |---|---|---|
 | Direct messaging | `agent/agent.py:361-368` — `message_agent()` calls `stack.insert_external_input()`. Example: `examples/agent_messaging` | The caller must already hold the target `Agent` object |
-| Sub-agents | `interaction/agent_call.py` creates the child via `parent_agent.session.create_agent_from_task(...)`; the child's `TaskResult.step()` resumes the parent by pushing onto `task_def.caller.stack` (`interaction/task_result.py:135-139`) | A live `caller` reference on both legs |
+| Sub-agents | `interaction/agent_call.py:98-111` creates the child via `parent_agent.session.create_agent_from_task(...)`; the child's `TaskResult.step()` resumes the parent by pushing an `AgentResult` onto `task_def.caller.stack` (`interaction/task_result.py:136-143`) | An id on the wire, a live object at resolution time — see below |
 | Stepping | `Session.step()` (`agent/session.py:158-179`) iterates `self.agents` | A list of live agents in one interpreter |
-| Shared state | `Environment.env_vars`, e.g. the documented `{"worlds": {"world_1": shared_world_object}}` (`CLAUDE.md`, "Shared State"); `examples/shared_state` | Arbitrary live Python objects — not serialisable in general |
+| Shared state | `Environment.env_vars`, e.g. the documented `{"worlds": {"world_1": shared_world_object}}` (`CLAUDE.md`, "Shared State"); and `SessionState` (`agent/session_state.py`), reached via `stack.get_shared_state` / `set_shared_state` | Arbitrary live Python objects — not serialisable in general |
 
 So "cross-machine" is not a transport problem bolted onto an existing seam. Each
 of these would need a remote answer, and the shared-state one may not have a
 good answer at all in its current form.
+
+Three details that shape the work more than the table does:
+
+- **The inbox is ephemeral.** `insert_external_input` appends to
+  `Stack.queued_interactions` (`interaction/stack.py:53`, `:431-441`), and
+  `Stack.to_dict` (`:675-687`) serialises only `interactions` and `artifacts`.
+  An in-flight message does not survive a save, a reload, or a crash. Any
+  cross-machine delivery needs a durable inbox that does not exist yet, even
+  for the local case.
+- **The sub-agent path is closer to portable than it looks.** `caller` is stored
+  as `caller_id` and resolved lazily through
+  `session.get_agent(caller_id)` (`interaction/task_definition.py:34-43`). The
+  persisted form is already id-based; only the *resolution* is in-process. But
+  the push is guarded by a bare `if task_def.caller:` with no else branch, so an
+  unresolvable caller fails silently — a parent on another machine would simply
+  wait forever. `Waiting`'s own check is purely structural (`interaction/waiting.py:50-67`):
+  no liveness check, no timeout, no heartbeat.
+- **Shared state round-trips lossily.** `SessionState.from_dict`
+  (`agent/session_state.py:304-321`) explicitly does not rehydrate — its
+  docstring says objects "will need to be reconstructed by the application code".
+  `Environment.env_vars` is never serialised at all.
 
 ## What is already networked (prior art to reuse, not rebuild)
 
@@ -42,7 +63,13 @@ good answer at all in its current form.
   already run an agent's *commands* on another host. Note the boundary: this
   distributes **tool execution**, not agent sessions. The agent stays here.
 - **Monitor server** — `cli/monitor_agents.py`, the only HTTP server in the
-  package. It reads a storage directory; it does not coordinate anything.
+  package. It reads a storage directory; no endpoint injects input into an agent.
+- **`the_hugins` world server** — `apps/the_hugins/world_server.py:702,877` is the
+  one place a network request already drives an agent: a POST resolves
+  `session.get_agent(id)` and calls `agent.message_agent(...)`. It works only
+  because the HTTP handler shares a process with the session (the session is a
+  class attribute, `:26`). This is the shape the idea wants, with the
+  process boundary still in the wrong place.
 - **Router correlation** — `llm/router_correlation.py` and `llm/router_outcome.py`
   already stamp a `session.id` across sub-agent LLM calls and report an
   edition's outcome to an external endpoint. Evidence that a session id is
@@ -56,11 +83,43 @@ interactions and artifacts. If two machines shared a storage backend they would
 already share the durable half of a session. That is worth investigating first,
 because it is the one place the codebase is already abstract.
 
-It is not sufficient on its own. Storage records what happened; it does not
-step an agent, deliver a message to a *running* stack, or tell machine B that
-machine A wants something. At minimum it leaves open: who steps which agent,
-how a waiting agent learns it can resume, and what happens when two machines
-write the same session.
+It is not sufficient on its own, and it is not ready as it stands:
+
+- `Storage.store` (`storage/storage.py:28`) is an in-process object cache that is
+  never invalidated — two processes on one backend would serve each other stale
+  objects.
+- There is no locking, no CAS or etag, no transactions. `_save_session` is a
+  plain non-atomic write (`storage/local.py:192-196`); only
+  `_detach_artifact_reference` bothers with a temp-file replace (`:170-183`).
+- `Stack.step` holds a non-reentrant `_step_lock` (`interaction/stack.py:54`,
+  `:395-399`), i.e. the scheduler assumes one thread per session.
+- An agent is not self-describing: `Tool.registry` is a process-global `ClassVar`
+  (`tools/tool.py:96`), and `Environment.load` mutates `sys.path` and imports
+  tool modules by bare name (`agent/environment.py:327-356`). A machine can only
+  step an agent whose package tree it can already import.
+
+And storage only records what happened. It does not step an agent, deliver a
+message to a *running* stack, or tell machine B that machine A wants something.
+At minimum it leaves open: who steps which agent, how a waiting agent learns it
+can resume, and what happens when two machines write the same session.
+
+## Discipline the sandbox work already established
+
+Whatever this becomes, it should not re-learn what tasks 023-033 already paid
+for:
+
+- `Sandbox` is an ABC with a lazy backend registry (`sandbox/sandbox.py:111-120`)
+  explicitly modelled on the `Storage` ABC — the repo's own precedent for
+  "pluggable, and one of them is remote".
+- The SSH backend refuses to guess: a completion sentinel distinguishes "the
+  command finished" from "the connection dropped mid-command", and the latter is
+  raised as do-not-retry rather than retried (`sandbox/ssh.py:104-117`). A
+  partition cannot hang a turn, and cannot silently double-execute.
+- The reaper already stamps ownership with PID, process start time, boot id and
+  hostname (`sandbox/reaper.py`) — the codebase has thought about "which machine
+  and which incarnation owns this" before.
+- `session.id` already works as a cross-service correlation key over HTTP
+  (`llm/router_correlation.py`, `llm/router_outcome.py`).
 
 ## Decide before building
 
@@ -96,6 +155,10 @@ paying for the mechanism.
   question of two runs *talking* while both are alive.
 - **026 — Bash sandbox SSH/remote backend (merged).** Prior art for reaching
   another machine, at the tool layer.
+- **029 — Bash sandbox "harness blend" (open, parked).** Proposes a shared
+  filesystem medium with a `common/` area for **cross-agent hand-offs** and a
+  one-writer-per-object invariant. Single machine, but it is the same hand-off
+  question one layer down; the two should not answer it differently.
 - **006 — Support batched tool calls end-to-end.** Unrelated, but touches the
   same stepping loop; worth checking for interactions if both land.
 
@@ -105,6 +168,11 @@ paying for the mechanism.
       four shapes above it is.
 - [ ] Spike the cheap version: a shared `Storage` implementation, two machines,
       one session, hand-off rather than live messaging. Report what breaks.
+      Expect the `Storage.store` cache and the absence of any write concurrency
+      control to break first.
+- [ ] Independently of any of this: decide whether `queued_interactions` should
+      be durable. An inbox that a save silently drops is a defect on one machine
+      too, and every remote design would have to fix it first.
 - [ ] From that, decide whether live cross-machine messaging is needed at all.
 - [ ] If it is: design the remote equivalents of `message_agent`, the
       `AgentCall`/`Waiting`/`TaskResult` resume path, and session stepping —

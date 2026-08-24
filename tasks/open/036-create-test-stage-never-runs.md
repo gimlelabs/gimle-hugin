@@ -41,8 +41,13 @@ Four pieces that are individually correct:
 - `interaction/waiting.py:50-67` — a `Waiting` whose previous interaction is an
   `AgentCall` returns `True` indefinitely, to keep the branch alive while the
   child runs.
-- `interaction/task_result.py:135-139` — the parent is resumed by the **child's**
-  `TaskResult.step()`, which pushes the result onto `task_def.caller.stack`.
+- `interaction/task_result.py:136-143` — the parent is resumed by the **child's**
+  `TaskResult.step()`, which pushes an `AgentResult` onto `task_def.caller.stack`.
+  Note `caller` is a property that resolves through
+  `self.stack.agent.session.get_agent(self.caller_id)`
+  (`interaction/task_definition.py:34-43`), and the push is guarded by a bare
+  `if task_def.caller:` with **no else branch** — so a caller that cannot be
+  resolved is not an error, it is silence.
 
 So the parent's resume depends on the child being stepped, and nothing steps it.
 `agent.step()` has no path into another agent; `Session.step()`
